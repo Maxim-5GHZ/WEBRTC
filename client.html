@@ -5,10 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WebRTC P2P Voice Chat</title>
     <style>
+        /* Добавляем стили для индикатора переподключения */
         :root {
             --primary: #4361ee;
             --success: #06d6a0;
             --danger: #ef476f;
+            --warning: #ffd166;
             --light: #f8f9fa;
             --dark: #212529;
         }
@@ -56,6 +58,40 @@
             font-weight: bold;
             color: var(--primary);
             min-height: 24px;
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .status-connected {
+            background-color: var(--success);
+        }
+
+        .status-disconnected {
+            background-color: var(--danger);
+        }
+
+        .status-connecting {
+            background-color: var(--warning);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
         }
 
         .users-card h2, .controls-card h2 {
@@ -131,6 +167,11 @@
             background: #e0355f;
         }
 
+        #reconnectButton {
+            background: var(--warning);
+            color: var(--dark);
+        }
+
         .call-info {
             text-align: center;
             margin-top: 15px;
@@ -162,6 +203,10 @@
 
     <div class="card status-card">
         <div id="status">Подготовка приложения...</div>
+        <div class="connection-status">
+            <span class="status-indicator status-connecting" id="connectionIndicator"></span>
+            <span id="connectionStatus">Подключение...</span>
+        </div>
     </div>
 
     <div class="card users-card">
@@ -175,6 +220,7 @@
         <div class="controls">
             <button id="startButton" disabled>Позвонить</button>
             <button id="hangupButton" disabled>Завершить</button>
+            <button id="reconnectButton" class="hidden">Переподключиться</button>
         </div>
         <div class="audio-container">
             <audio id="remoteAudio" autoplay playsinline></audio>
@@ -184,9 +230,12 @@
     <script>
         // Элементы интерфейса
         const statusEl = document.getElementById('status');
+        const connectionIndicator = document.getElementById('connectionIndicator');
+        const connectionStatusEl = document.getElementById('connectionStatus');
         const usersListEl = document.getElementById('usersList');
         const startButton = document.getElementById('startButton');
         const hangupButton = document.getElementById('hangupButton');
+        const reconnectButton = document.getElementById('reconnectButton');
         const remoteAudio = document.getElementById('remoteAudio');
         const callInfoEl = document.getElementById('callInfo');
 
@@ -197,6 +246,10 @@
         let currentUserId = null;
         let targetUserId = null;
         let users = [];
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 10;
+        let reconnectTimeout = null;
+        let isManualReconnect = false;
 
         // Конфигурация ICE-серверов
         const configuration = {
@@ -213,37 +266,131 @@
             iceTransportPolicy: 'all'
         };
 
+        // Обновление статуса подключения
+        function updateConnectionStatus(status, message) {
+            connectionStatusEl.textContent = message;
+            connectionIndicator.className = 'status-indicator';
+
+            switch(status) {
+                case 'connected':
+                    connectionIndicator.classList.add('status-connected');
+                    reconnectButton.classList.add('hidden');
+                    break;
+                case 'disconnected':
+                    connectionIndicator.classList.add('status-disconnected');
+                    reconnectButton.classList.remove('hidden');
+                    break;
+                case 'connecting':
+                    connectionIndicator.classList.add('status-connecting');
+                    reconnectButton.classList.add('hidden');
+                    break;
+            }
+        }
+
         // Инициализация приложения
         async function init() {
             try {
-                // 1. Запрос доступа к микрофону
-                statusEl.textContent = 'Запрос доступа к микрофону...';
-                await requestMicrophoneAccess();
+                updateConnectionStatus('connecting', 'Подключение...');
 
-                // 2. Получение уникального ID
+                // 1. Получение уникального ID
                 const response = await fetch('/generate_id');
                 const data = await response.json();
                 currentUserId = data.id;
                 statusEl.textContent = `Ваш ID: ${currentUserId}`;
 
-                // 3. Определение протокола WebSocket (ws/wss)
-                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                // 2. Подключение к WebSocket
+                await connectWebSocket();
 
-                // 4. Подключение к сигнальному серверу через WSS
-                socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/${currentUserId}`);
-
-                // Обработчики сообщений WebSocket
-                socket.onmessage = handleSocketMessage;
-                socket.onopen = () => statusEl.textContent = `Подключено к серверу (ID: ${currentUserId})`;
-                socket.onclose = () => statusEl.textContent = 'Соединение с сервером разорвано';
-                socket.onerror = (err) => {
-                    statusEl.textContent = 'Ошибка соединения с сервером';
-                    console.error('WebSocket error:', err);
-                };
+                // 3. Запрос доступа к микрофону
+                statusEl.textContent = 'Запрос доступа к микрофону...';
+                await requestMicrophoneAccess();
 
                 startButton.disabled = false;
             } catch (err) {
                 console.error('Ошибка инициализации:', err);
+                updateConnectionStatus('disconnected', 'Ошибка инициализации');
+            }
+        }
+
+        // Подключение к WebSocket
+        async function connectWebSocket() {
+            return new Promise((resolve, reject) => {
+                try {
+                    // Определение протокола WebSocket (ws/wss)
+                    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+                    socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/${currentUserId}`);
+
+                    socket.onopen = () => {
+                        updateConnectionStatus('connected', 'Подключено');
+                        statusEl.textContent = `Подключено к серверу (ID: ${currentUserId})`;
+                        reconnectAttempts = 0;
+                        // Запрашиваем список пользователей после подключения
+                        sendMessage({type: "get_users"});
+                        resolve();
+                    };
+
+                    socket.onclose = (event) => {
+                        console.log('WebSocket закрыт:', event.code, event.reason);
+                        if (!isManualReconnect) {
+                            handleDisconnection();
+                        }
+                        isManualReconnect = false;
+                    };
+
+                    socket.onerror = (error) => {
+                        console.error('WebSocket ошибка:', error);
+                        updateConnectionStatus('disconnected', 'Ошибка подключения');
+                        reject(error);
+                    };
+
+                    socket.onmessage = handleSocketMessage;
+
+                } catch (error) {
+                    console.error('Ошибка создания WebSocket:', error);
+                    reject(error);
+                }
+            });
+        }
+
+        // Обработка отключения
+        function handleDisconnection() {
+            updateConnectionStatus('disconnected', 'Отключено от сервера');
+
+            if (reconnectAttempts < maxReconnectAttempts) {
+                reconnectAttempts++;
+                const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000); // Экспоненциальная задержка
+
+                updateConnectionStatus('connecting', `Переподключение через ${Math.round(delay/1000)}сек...`);
+
+                reconnectTimeout = setTimeout(async () => {
+                    try {
+                        await connectWebSocket();
+                    } catch (error) {
+                        handleDisconnection();
+                    }
+                }, delay);
+            } else {
+                updateConnectionStatus('disconnected', 'Не удалось подключиться. Обновите страницу.');
+            }
+        }
+
+        // Ручное переподключение
+        async function manualReconnect() {
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+            }
+            isManualReconnect = true;
+            reconnectAttempts = 0;
+            updateConnectionStatus('connecting', 'Переподключение...');
+
+            try {
+                if (socket) {
+                    socket.close();
+                }
+                await connectWebSocket();
+            } catch (error) {
+                handleDisconnection();
             }
         }
 
@@ -268,33 +415,31 @@
                 // Обработка ошибок доступа
                 console.error('Ошибка доступа к микрофону:', error);
 
-                // Определяем тип ошибки
                 let errorMessage;
                 switch (error.name) {
                     case 'NotAllowedError':
-                        errorMessage = 'Доступ к микрофону запрещен. Разрешите доступ в настройках браузера';
+                        errorMessage = 'Доступ к микрофону запрещен';
                         break;
                     case 'NotFoundError':
                     case 'OverconstrainedError':
-                        errorMessage = 'Микрофон не найден. Проверьте подключение устройства';
+                        errorMessage = 'Микрофон не найден';
                         break;
                     case 'NotReadableError':
-                        errorMessage = 'Невозможно получить доступ к микрофону. Убедитесь, что он не используется другим приложением';
+                        errorMessage = 'Микрофон используется другим приложением';
                         break;
                     default:
-                        errorMessage = 'Ошибка при доступе к микрофону: ' + error.message;
+                        errorMessage = 'Ошибка доступа к микрофону';
                 }
 
                 statusEl.textContent = errorMessage;
                 startButton.disabled = true;
 
-                // Создаем кнопку для повторной попытки
                 const retryButton = document.createElement('button');
                 retryButton.id = 'retryButton';
                 retryButton.textContent = 'Повторить попытку';
                 retryButton.addEventListener('click', requestMicrophoneAccess);
-
                 statusEl.parentElement.appendChild(retryButton);
+
                 throw error;
             }
         }
@@ -303,6 +448,7 @@
         async function handleSocketMessage(event) {
             try {
                 const message = JSON.parse(event.data);
+                console.log("Получено сообщение:", message);
 
                 if (message.type === 'users') {
                     users = message.users.filter(id => id !== currentUserId);
@@ -495,6 +641,9 @@
         function sendMessage(message) {
             if (socket && socket.readyState === WebSocket.OPEN) {
                 socket.send(JSON.stringify(message));
+                console.log("Отправлено сообщение:", message);
+            } else {
+                console.error("WebSocket не подключен");
             }
         }
 
@@ -525,6 +674,7 @@
         // Назначение обработчиков событий
         startButton.addEventListener('click', startCall);
         hangupButton.addEventListener('click', hangUp);
+        reconnectButton.addEventListener('click', manualReconnect);
 
         // Запуск приложения
         init();
@@ -534,6 +684,9 @@
             if (socket) socket.close();
             if (localStream) {
                 localStream.getTracks().forEach(track => track.stop());
+            }
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
             }
         });
     </script>
